@@ -25,11 +25,13 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
 	"io"
 	"math/big"
 	"net"
+	"net/url"
 	"testing"
 	"time"
 
@@ -881,6 +883,286 @@ func TestInitializeChassis(t *testing.T) {
 			}
 			if diff := cmp.Diff(got, tc.want, protocmp.Transform()); diff != "" {
 				t.Errorf("initializeChassis diff = %v", diff)
+			}
+		})
+	}
+}
+
+func TestCalculateCertSerial(t *testing.T) {
+	mustParseURI := func(raw string) *url.URL {
+		t.Helper()
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("failed to parse URI %q: %v", raw, err)
+		}
+		return u
+	}
+
+	tests := []struct {
+		name string
+		cert *x509.Certificate
+		want string
+	}{
+		{
+			name: "Nil cert",
+			cert: nil,
+			want: "",
+		},
+		{
+			name: "Empty cert",
+			cert: &x509.Certificate{},
+			want: "",
+		},
+		{
+			name: "Subject SerialNumber plain serial",
+			cert: &x509.Certificate{
+				Subject: pkix.Name{
+					SerialNumber: "SCMN260800493",
+				},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "Subject SerialNumber with SN: prefix",
+			cert: &x509.Certificate{
+				Subject: pkix.Name{
+					SerialNumber: "SN:SCMN260800493",
+				},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "Subject SerialNumber Cisco format with PID and SN:",
+			cert: &x509.Certificate{
+				Subject: pkix.Name{
+					SerialNumber: "PID:N9K-C93180YC-FX SN:SCMN260800493",
+				},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "Subject SerialNumber with whitespace padding",
+			cert: &x509.Certificate{
+				Subject: pkix.Name{
+					SerialNumber: "PID:N9K-C93180YC-FX SN:  SCMN260800493  ",
+				},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "Subject SerialNumber with SN: but empty serial falls back to SAN URI",
+			cert: &x509.Certificate{
+				Subject: pkix.Name{
+					SerialNumber: "SN:",
+				},
+				URIs: []*url.URL{mustParseURI("urn:serial:SCMN260800493")},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "Subject SerialNumber whitespace only falls back to SAN URI",
+			cert: &x509.Certificate{
+				Subject: pkix.Name{
+					SerialNumber: "   ",
+				},
+				URIs: []*url.URL{mustParseURI("urn:serial:SCMN260800493")},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "SubjectAltName URI with urn:serial: prefix",
+			cert: &x509.Certificate{
+				URIs: []*url.URL{mustParseURI("urn:serial:SCMN260800493")},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "SubjectAltName URI uppercase URN:SERIAL:",
+			cert: &x509.Certificate{
+				URIs: []*url.URL{mustParseURI("URN:SERIAL:SCMN260800493")},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "SubjectAltName URI mixed-case urn:Serial:",
+			cert: &x509.Certificate{
+				URIs: []*url.URL{mustParseURI("urn:Serial:SCMN260800493")},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "SubjectAltName URI with whitespace padding",
+			cert: &x509.Certificate{
+				URIs: []*url.URL{mustParseURI("urn:serial:  SCMN260800493  ")},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "Multiple URIs in SAN with urn:serial: match",
+			cert: &x509.Certificate{
+				URIs: []*url.URL{
+					mustParseURI("https://example.com/device"),
+					mustParseURI("urn:serial:SCMN260800493"),
+				},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "SubjectAltName URIs without urn:serial: match",
+			cert: &x509.Certificate{
+				URIs: []*url.URL{
+					mustParseURI("https://example.com/device"),
+					mustParseURI("urn:uuid:12345"),
+				},
+			},
+			want: "",
+		},
+		{
+			name: "SubjectAltName URI with empty serial",
+			cert: &x509.Certificate{
+				URIs: []*url.URL{mustParseURI("urn:serial:")},
+			},
+			want: "",
+		},
+		{
+			name: "SubjectAltName URIs with nil element",
+			cert: &x509.Certificate{
+				URIs: []*url.URL{nil, mustParseURI("urn:serial:SCMN260800493")},
+			},
+			want: "SCMN260800493",
+		},
+		{
+			name: "Both Subject SerialNumber and SAN URI present",
+			cert: &x509.Certificate{
+				Subject: pkix.Name{
+					SerialNumber: "SCMN260800493",
+				},
+				URIs: []*url.URL{mustParseURI("urn:serial:SCMN260800493")},
+			},
+			want: "SCMN260800493",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := calculateCertSerial(tc.cert)
+			if got != tc.want {
+				t.Errorf("calculateCertSerial() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateIDevID_SubjectAltName(t *testing.T) {
+	vendorCA, vendorCAKey, err := ownercertificate.NewRSACertificate("Vendor CA", "", nil, nil)
+	if err != nil {
+		t.Fatalf("Failed to create vendor certificate authority: %v", err)
+	}
+
+	createCert := func(serial string, uris []*url.URL) string {
+		template := &x509.Certificate{
+			SerialNumber: big.NewInt(100),
+			Subject: pkix.Name{
+				CommonName:   "test-idevid",
+				SerialNumber: serial,
+			},
+			URIs:                  uris,
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(24 * time.Hour),
+			KeyUsage:              x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			BasicConstraintsValid: true,
+		}
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatalf("failed to generate key: %v", err)
+		}
+		der, err := x509.CreateCertificate(rand.Reader, template, vendorCA, &key.PublicKey, vendorCAKey)
+		if err != nil {
+			t.Fatalf("failed to create certificate: %v", err)
+		}
+		return base64.StdEncoding.EncodeToString(der)
+	}
+
+	sanURI, err := url.Parse("urn:serial:SCMN260800493")
+	if err != nil {
+		t.Fatalf("failed to parse URI: %v", err)
+	}
+
+	certWithSAN := createCert("", []*url.URL{sanURI})
+	certWithSubject := createCert("SCMN260800493", nil)
+	certNoSerial := createCert("", nil)
+
+	am := &mockArtifactManager{
+		vendorCA: vendorCA,
+	}
+	s := &Service{
+		am: am,
+	}
+
+	tests := []struct {
+		name        string
+		chassis     *types.Chassis
+		wantErrCode codes.Code
+	}{
+		{
+			name: "SAN URI serial matches chassis serial",
+			chassis: &types.Chassis{
+				Serials: []string{"SCMN260800493"},
+				Identity: &bpb.Identity{
+					Type: &bpb.Identity_IdevidCert{IdevidCert: certWithSAN},
+				},
+			},
+			wantErrCode: codes.OK,
+		},
+		{
+			name: "SAN URI serial does not match chassis serial",
+			chassis: &types.Chassis{
+				Serials: []string{"DIFFERENT_SERIAL"},
+				Identity: &bpb.Identity{
+					Type: &bpb.Identity_IdevidCert{IdevidCert: certWithSAN},
+				},
+			},
+			wantErrCode: codes.InvalidArgument,
+		},
+		{
+			name: "Subject SerialNumber matches chassis serial",
+			chassis: &types.Chassis{
+				Serials: []string{"SCMN260800493"},
+				Identity: &bpb.Identity{
+					Type: &bpb.Identity_IdevidCert{IdevidCert: certWithSubject},
+				},
+			},
+			wantErrCode: codes.OK,
+		},
+		{
+			name: "No serial in certificate returns InvalidArgument",
+			chassis: &types.Chassis{
+				Serials: []string{"SCMN260800493"},
+				Identity: &bpb.Identity{
+					Type: &bpb.Identity_IdevidCert{IdevidCert: certNoSerial},
+				},
+			},
+			wantErrCode: codes.InvalidArgument,
+		},
+		{
+			name: "SkipIDevIDSerialValidation bypasses mismatch",
+			chassis: &types.Chassis{
+				Serials:                    []string{"DIFFERENT_SERIAL"},
+				SkipIDevIDSerialValidation: true,
+				Identity: &bpb.Identity{
+					Type: &bpb.Identity_IdevidCert{IdevidCert: certWithSAN},
+				},
+			},
+			wantErrCode: codes.OK,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := s.validateIDevID(context.Background(), tc.chassis)
+			if status.Code(err) != tc.wantErrCode {
+				t.Errorf("validateIDevID() err = %v, want code %v", err, tc.wantErrCode)
 			}
 		})
 	}

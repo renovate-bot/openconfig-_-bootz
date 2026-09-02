@@ -952,13 +952,7 @@ func (s *Service) validateIDevID(ctx context.Context, chassis *types.Chassis) (*
 		return cert, nil
 	}
 
-	// cert.Subject.SerialNumber can come in the format PID:xxxxxxx SN:1234JF or just the serial number as it is. We need the value after "SN:".
-	var certSerial string
-	if sn := strings.Split(cert.Subject.SerialNumber, "SN:"); len(sn) != 2 {
-		certSerial = strings.TrimSpace(sn[0])
-	} else {
-		certSerial = strings.TrimSpace(sn[1])
-	}
+	certSerial := calculateCertSerial(cert)
 
 	if !slices.ContainsFunc(chassis.Serials, func(serial string) bool {
 		return strings.EqualFold(certSerial, serial)
@@ -967,6 +961,37 @@ func (s *Service) validateIDevID(ctx context.Context, chassis *types.Chassis) (*
 	}
 
 	return cert, nil
+}
+
+// calculateCertSerial extracts the serial number from an x509 certificate.
+// It checks cert.Subject.SerialNumber first (supporting "PID:<pid> SN:<serial>" and raw "<serial>" formats),
+// and subjectAltName URIs for a "urn:serial:<serial>" URI.
+func calculateCertSerial(cert *x509.Certificate) string {
+	if cert == nil {
+		return ""
+	}
+	if cert.Subject.SerialNumber != "" {
+		if sn := strings.Split(cert.Subject.SerialNumber, "SN:"); len(sn) == 2 {
+			if s := strings.TrimSpace(sn[1]); s != "" {
+				return s
+			}
+		} else if s := strings.TrimSpace(sn[0]); s != "" {
+			return s
+		}
+	}
+	const uriSerialPrefix = "urn:serial:"
+	for _, u := range cert.URIs {
+		if u == nil {
+			continue
+		}
+		uriStr := u.String()
+		if strings.HasPrefix(strings.ToLower(uriStr), uriSerialPrefix) {
+			if s := strings.TrimSpace(uriStr[len(uriSerialPrefix):]); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // sign generates the signature over given data using the Owner Certificate, and returns the signature string, Ownership Voucher, and Owner Certificate.
