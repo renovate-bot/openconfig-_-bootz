@@ -971,13 +971,18 @@ func calculateCertSerial(cert *x509.Certificate) string {
 		return ""
 	}
 	if cert.Subject.SerialNumber != "" {
-		if sn := strings.Split(cert.Subject.SerialNumber, "SN:"); len(sn) == 2 {
-			if s := strings.TrimSpace(sn[1]); s != "" {
+		parts := strings.Split(cert.Subject.SerialNumber, "SN:")
+		switch len(parts) {
+		case 1: // "SN:" not found
+			if s := strings.TrimSpace(parts[0]); s != "" {
 				return s
 			}
-		} else if s := strings.TrimSpace(sn[0]); s != "" {
-			return s
+		case 2: // "SN:" found once
+			if s := strings.TrimSpace(parts[1]); s != "" {
+				return s
+			}
 		}
+		// If len(parts) > 2, format is ambiguous, so we fall through to check SAN.
 	}
 	const uriSerialPrefix = "urn:serial:"
 	for _, u := range cert.URIs {
